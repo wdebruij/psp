@@ -77,6 +77,9 @@
 #include <net/ax25.h>
 #include <net/rose.h>
 #include <net/6lowpan.h>
+#include <net/psp_defs.h>
+#include <net/psp_dev.h>
+#include <net/udp.h>
 
 #include <linux/uaccess.h>
 #include <linux/proc_fs.h>
@@ -1005,6 +1008,65 @@ static unsigned int run_ebpf_filter(struct tun_struct *tun,
 	return len;
 }
 
+#ifdef CONFIG_INET_PSP
+static int tun_skb_is_psp(struct sk_buff *skb)
+{
+	unsigned int hlen = sizeof(struct ipv6hdr) + PSP_ENCAP_HLEN;
+	const struct udphdr *uh;
+	const struct psphdr *ph;
+	const struct tcphdr *th;
+
+	if (skb->protocol != htons(ETH_P_IPV6))
+		return 0;
+
+	if (!pskb_may_pull(skb, hlen + sizeof(struct tcphdr)))
+		return 0;
+
+	if (ipv6_hdr(skb)->nexthdr != IPPROTO_UDP)
+		return 0;
+
+	uh = (const struct udphdr *)(skb->data + sizeof(struct ipv6hdr));
+	if (uh->dest != htons(PSP_UDP_DPORT))
+		return 0;
+
+	ph = (const struct psphdr *)(uh + 1);
+	if (ph->nh != IPPROTO_TCP)
+		return 0;
+
+	th = (const struct tcphdr *)(ph + 1);
+	hlen += __tcp_hdrlen(th);
+	if (!pskb_may_pull(skb, hlen))
+		return 0;
+
+	return hlen;
+}
+
+/* Tun supports PSP for testing only. Zero any PSP payload.
+ *
+ * The tun driver does not actually encrypt. Avoid accidentally leaking
+ * plaintext if anyone were to try to use tun with real data, by zeroing it.
+ *
+ * The protocol tests that need this code ignore contents. They also do not
+ * require high performance, so linearization, while expensive, is acceptable.
+ *
+ * Return 1 if is psp and was unable to zero, 0 otherwise.
+ */
+static int tun_net_zero_psp_payload(struct sk_buff *skb)
+{
+	int hlen;
+
+	hlen = tun_skb_is_psp(skb);
+	if (!hlen)
+		return 0;
+
+	if (skb_linearize(skb))
+		return 1;
+
+	memset(skb->data + hlen, 0, skb->len - hlen);
+	return 0;
+}
+#endif
+
 /* Net device start xmit */
 static netdev_tx_t tun_net_xmit(struct sk_buff *skb, struct net_device *dev)
 {
@@ -1034,6 +1096,11 @@ static netdev_tx_t tun_net_xmit(struct sk_buff *skb, struct net_device *dev)
 	if (tfile->socket.sk->sk_filter &&
 	    sk_filter(tfile->socket.sk, skb))
 		goto drop;
+
+#ifdef CONFIG_INET_PSP
+	if (SKB_PSP_SPI(skb) && tun_net_zero_psp_payload(skb))
+		goto drop;
+#endif
 
 	len = run_ebpf_filter(tun, skb, len);
 	if (len == 0 || pskb_trim(skb, len))
@@ -1163,6 +1230,27 @@ static int tun_net_change_carrier(struct net_device *dev, bool new_carrier)
 	return 0;
 }
 
+#ifdef CONFIG_INET_PSP
+int tun_get_spi_and_key(struct net_device *dev, struct psp_spi_tuple *tuple)
+{
+	static psp_spi global_spi = 1;
+
+	/* Fail rather than wrap or reach SPI 0 on the second slot.
+	 * We should not generate this many SPIs in functional testing.
+	 */
+	if (global_spi == PSP_SKB_SPI_SPECIAL) {
+		WARN_ONCE(1, "tun: out of SPI");
+		return 1;
+	}
+
+	memset(tuple, 0, sizeof(*tuple));
+	tuple->spi = global_spi++;
+
+	return 0;
+}
+
+#endif
+
 static const struct net_device_ops tun_netdev_ops = {
 	.ndo_uninit		= tun_net_uninit,
 	.ndo_open		= tun_net_open,
@@ -1173,6 +1261,9 @@ static const struct net_device_ops tun_netdev_ops = {
 	.ndo_set_rx_headroom	= tun_set_headroom,
 	.ndo_get_stats64	= tun_net_get_stats64,
 	.ndo_change_carrier	= tun_net_change_carrier,
+#ifdef CONFIG_INET_PSP
+	.ndo_get_spi_and_key    = tun_get_spi_and_key,
+#endif
 };
 
 static void __tun_xdp_flush_tfile(struct tun_file *tfile)
@@ -1644,6 +1735,33 @@ out:
 	return NULL;
 }
 
+#ifdef CONFIG_INET_PSP
+static void tun_decap_psp(struct sk_buff *skb)
+{
+	const struct psphdr *ph;
+	const struct tcphdr *th;
+	struct ipv6hdr *iph;
+	int tcp_hlen;
+
+	ph = (const struct psphdr *)(skb->data + sizeof(*iph) + sizeof(struct udphdr));
+	th = (const struct tcphdr *)(ph + 1);
+	tcp_hlen = __tcp_hdrlen(th);
+
+	skb->psp.gen = 0;
+	skb->psp.spi = ph->spi;
+	skb->psp.hdr_len = sizeof(*iph) + tcp_hlen;
+	skb->ip_summed = CHECKSUM_UNNECESSARY;
+
+	iph = (struct ipv6hdr *)skb->data;
+	iph->payload_len = htons(ntohs(iph->payload_len) - PSP_ENCAP_HLEN);
+	iph->nexthdr = IPPROTO_TCP;
+
+	/* remove PSP+UDP headers, adjust skb length */
+	memmove(skb->data + PSP_ENCAP_HLEN, skb->data, sizeof(*iph));
+	__skb_pull(skb, PSP_ENCAP_HLEN);
+}
+#endif
+
 /* Get packet from user space buffer */
 static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
 			    void *msg_control, struct iov_iter *from,
@@ -1830,6 +1948,11 @@ drop:
 	skb_reset_network_header(skb);
 	skb_probe_transport_header(skb);
 	skb_record_rx_queue(skb, tfile->queue_index);
+
+#ifdef CONFIG_INET_PSP
+	if ((tun->dev->features & NETIF_F_IP_PSP) && tun_skb_is_psp(skb))
+		tun_decap_psp(skb);
+#endif
 
 	if (skb_xdp) {
 		struct bpf_prog *xdp_prog;
@@ -2729,7 +2852,19 @@ static int tun_set_iff(struct net *net, struct file *file, struct ifreq *ifr)
 		dev->hw_features = NETIF_F_SG | NETIF_F_FRAGLIST |
 				   TUN_USER_FEATURES | NETIF_F_HW_VLAN_CTAG_TX |
 				   NETIF_F_HW_VLAN_STAG_TX;
+#ifdef CONFIG_INET_PSP
+		dev->hw_features |= NETIF_F_IP_PSP | NETIF_F_PSP_TSO;
+		/* because psp sets skb->encapsulation */
+		dev->hw_enc_features = dev->hw_features;
+#endif
 		dev->features = dev->hw_features | NETIF_F_LLTX;
+#ifdef CONFIG_INET_PSP
+		/* Disable PSP by default: only for tests that explicitly enable it.
+		* The flag must be in TUN_USER_FEATURES, hw_features and
+		* hw_enc_features to successfully enable it at runtime.
+		*/
+		dev->features &= ~NETIF_F_IP_PSP;
+#endif
 		dev->vlan_features = dev->features &
 				     ~(NETIF_F_HW_VLAN_CTAG_TX |
 				       NETIF_F_HW_VLAN_STAG_TX);
