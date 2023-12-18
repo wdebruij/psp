@@ -254,7 +254,7 @@ int ip6_xmit(const struct sock *sk, struct sk_buff *skb, struct flowi6 *fl6,
 	struct inet6_dev *idev = ip6_dst_idev(dst);
 	unsigned int head_room;
 	struct ipv6hdr *hdr;
-	u8  proto = fl6->flowi6_proto;
+	u8  proto = skb_l3hdr_protocol(skb, fl6->flowi6_proto);
 	int seg_len = skb->len;
 	int hlimit = -1;
 	u32 mtu;
@@ -1865,6 +1865,8 @@ struct sk_buff *__ip6_make_skb(struct sock *sk,
 
 	/* Allow local fragmentation. */
 	skb->ignore_df = ip6_sk_ignore_df(sk);
+
+	proto = skb_l3hdr_protocol(skb, proto);
 
 	*final_dst = fl6->daddr;
 	__skb_pull(skb, skb_network_header_len(skb));

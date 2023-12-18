@@ -9,6 +9,18 @@
 #include <net/psp_defs.h>
 #include <uapi/linux/udp.h>
 
+/* Encapsulation in the netdevice is simpler than in the TCP stack.
+ * Edge cases such as software segmentation need not be handled.
+ *
+ * For real devices, define this flag and encap in the driver
+ * (analogous to how all drivers have to decap in the driver).
+ *
+ * For packetdrill testing we need to maintain the previous in-stack
+ * approach. Because it reads packets not using tun_put_user, but
+ * using packet sockets. These intercept before device can encap.
+ */
+#undef CONFIG_INET_PSP_ENCAP_IN_DEV
+
 extern struct static_key_false tcp_psp_needed;
 
 /* Return whether a TCP socket uses PSP */
@@ -19,6 +31,24 @@ static inline bool tcp_uses_psp(const struct tcp_sock *tp)
 		return tp->psp.tx_info.spi != 0;
 #endif
 	return false;
+}
+
+/* Return the protocol to be used in L3 headers, i.e., IP protocol field or
+ * IPv6 next header. The result is either the supplied proto or an override
+ * value based on the skb.
+ */
+static inline u8 skb_l3hdr_protocol(struct sk_buff *skb, u8 proto)
+{
+#ifdef CONFIG_INET_PSP
+	if (skb->psp.spi == PSP_SKB_SPI_SPECIAL) {
+		const struct psphdr *ph;
+
+		ph = (void *)(skb_transport_header(skb) + sizeof(struct udphdr));
+		skb->psp.spi = ph->spi;
+		return IPPROTO_UDP;
+	}
+#endif
+	return proto;
 }
 
 static inline void psp_reuseport_init(struct psp_reuseport *reuse)
@@ -198,7 +228,11 @@ static inline void psp_encap(struct net *net, struct sk_buff *skb,
 {
 #ifdef CONFIG_INET_PSP
 	if (key_spi && key_spi->spi)
+#ifdef CONFIG_INET_PSP_ENCAP_IN_DEV
 		psp_set_psp_skb(skb, key_spi);
+#else
+		psp_encapsulate(net, skb, key_spi);
+#endif
 #endif
 }
 
@@ -210,7 +244,11 @@ static inline void psp_encapsulate_tcp(struct sk_buff *skb,
 	const struct tcp_sock *tp = tcp_sk(sk);
 
 	if (tcp_uses_psp(tp))
+#ifdef CONFIG_INET_PSP_ENCAP_IN_DEV
 		psp_set_psp_skb(skb, &tp->psp.tx_info);
+#else
+		psp_encapsulate(sock_net(sk), skb, &tp->psp.tx_info);
+#endif
 #endif
 }
 
@@ -228,6 +266,13 @@ static inline void psp_fill_reply_arg(struct ip_reply_arg *arg,
 {
 #ifdef CONFIG_INET_PSP
 	if (key_spi && key_spi->spi) {
+#ifndef CONFIG_INET_PSP_ENCAP_IN_DEV
+		arg->iov[0].iov_base -= PSP_ENCAP_HLEN;
+		arg->iov[0].iov_len += PSP_ENCAP_HLEN;
+
+		/* arg->csumoffset is relative to the outer transport header */
+		arg->csumoffset += PSP_ENCAP_HLEN / 2;
+#endif
 		arg->psp_key_spi = key_spi;
 	}
 #endif
@@ -242,7 +287,11 @@ static inline void psp_encap_reply(struct net *net, struct sk_buff *skb,
 {
 #ifdef CONFIG_INET_PSP
 	if (arg->psp_key_spi) {
+#ifdef CONFIG_INET_PSP_ENCAP_IN_DEV
 		psp_set_psp_skb(skb, arg->psp_key_spi);
+#else
+		psp_finish_encap(net, skb, arg->psp_key_spi);
+#endif
 	}
 #endif
 }

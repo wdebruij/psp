@@ -29,6 +29,13 @@ static struct sk_buff *udp6_ufo_fragment(struct sk_buff *skb,
 	int tnl_hlen;
 	int err;
 
+#ifdef CONFIG_INET_PSP
+	if (skb->encapsulation && (skb_shinfo(skb)->gso_type & SKB_GSO_PSP)) {
+		segs = psp_segment(skb, features, inet6_offloads);
+		goto out;
+	}
+#endif
+
 	if (skb->encapsulation && skb_shinfo(skb)->gso_type &
 	    (SKB_GSO_UDP_TUNNEL|SKB_GSO_UDP_TUNNEL_CSUM))
 		segs = skb_udp_tunnel_segment(skb, features, true);

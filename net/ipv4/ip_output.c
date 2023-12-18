@@ -162,7 +162,7 @@ int ip_build_and_send_pkt(struct sk_buff *skb, const struct sock *sk,
 	iph->ttl      = ip_select_ttl(inet, &rt->dst);
 	iph->daddr    = (opt && opt->opt.srr ? opt->opt.faddr : daddr);
 	iph->saddr    = saddr;
-	iph->protocol = sk->sk_protocol;
+	iph->protocol = skb_l3hdr_protocol(skb, sk->sk_protocol);
 	if (ip_dont_fragment(sk, &rt->dst)) {
 		iph->frag_off = htons(IP_DF);
 		iph->id = 0;
@@ -506,7 +506,7 @@ packet_routed:
 	else
 		iph->frag_off = 0;
 	iph->ttl      = ip_select_ttl(inet, &rt->dst);
-	iph->protocol = sk->sk_protocol;
+	iph->protocol = skb_l3hdr_protocol(skb, sk->sk_protocol);
 	ip_copy_addrs(iph, fl4);
 
 	/* Transport layer set skb->h.foo itself. */
@@ -1521,7 +1521,7 @@ struct sk_buff *__ip_make_skb(struct sock *sk,
 	iph->tos = (cork->tos != -1) ? cork->tos : inet->tos;
 	iph->frag_off = df;
 	iph->ttl = ttl;
-	iph->protocol = sk->sk_protocol;
+	iph->protocol = skb_l3hdr_protocol(skb, sk->sk_protocol);
 	ip_copy_addrs(iph, fl4);
 	ip_select_ident(net, skb, sk);
 
